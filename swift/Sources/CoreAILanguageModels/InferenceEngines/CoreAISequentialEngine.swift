@@ -41,6 +41,10 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     private let function: InferenceFunction
     private let functionDescriptor: InferenceFunctionDescriptor
 
+    // Optional prefill graph. Prefill chunks run here when the asset has it. It produces
+    // no logits, so the last prompt token still goes through `function`.
+    private let prefillFunction: InferenceFunction?
+
     // I/O names from descriptor
     private let inputIdsName: String
     private let positionIdsName: String
@@ -179,6 +183,12 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.cachedInputBatchSize = 1
 
         // Load inference function
+        self.prefillFunction = try loadPrefillGraph(
+            from: model, matching: descriptor, mainName: config.function)
+        if self.prefillFunction != nil {
+            CLILogger.log("Found '\(prefillGraphFunctionName)' graph — prefill skips the LM head")
+        }
+
         guard let fn = try model.loadFunction(named: config.function) else {
             throw InferenceRuntimeError.genericError(
                 "Cannot load function '\(config.function)'")
@@ -209,7 +219,13 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // MARK: - Prefill Strategy
 
     private func selectPrefillStrategy(newTokenCount: Int) -> PrefillStrategy {
-        if newTokenCount > config.chunkThreshold {
+        // With a prefill graph, chunking is cheaper at any size: every chunk but the last
+        // token skips the LM head, so there is no threshold to clear.
+        if shouldChunkPrefill(
+            tokenCount: newTokenCount,
+            hasPrefillGraph: prefillFunction != nil,
+            chunkThreshold: config.chunkThreshold)
+        {
             return .chunked(chunkSize: config.prefillChunkSize)
         }
         return .wholeBatch
@@ -280,35 +296,73 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         return logitBuffer
     }
 
+    /// Run one prefill chunk on the prefill graph: KV cache writes only, no logits.
+    private func encodePrefillChunk(
+        _ tokens: ArraySlice<Int32>, using prefillFn: InferenceFunction
+    ) async throws {
+        let batchSize = tokens.count
+        _ = try kvCache.ensureCapacity(forContextLength: processedTokenCount + batchSize)
+
+        if cachedInputBatchSize != batchSize {
+            let resolvedInputDesc = inputIdsDescriptor.resolvingDynamicDimensions([1, batchSize])
+            inputIdsArray = NDArray(descriptor: resolvedInputDesc)
+            cachedInputBatchSize = batchSize
+        }
+        fillNDArray(&inputIdsArray, as: Int32.self, with: tokens)
+
+        let totalPositions = processedTokenCount + batchSize
+        let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
+        var positionIds = NDArray(descriptor: resolvedPosDesc)
+        fillNDArray(&positionIds, as: Int32.self, count: totalPositions) { Int32($0) }
+
+        try await runWithStatesNoOutputs(
+            function: prefillFn,
+            inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
+            primary: kvCache,
+            secondary: additionalStates)
+
+        processedTokenCount += batchSize
+    }
+
     // MARK: - Chunked Prefill
 
     private func processChunkedPrompt(
         tokens: ArraySlice<Int32>,
         chunkSize: Int
     ) async throws -> [LogitsScalarType] {
-        let totalChunks = (tokens.count + chunkSize - 1) / chunkSize
+        // The prefill graph produces no logits, so hold the final token back for
+        // `function`: it is the one whose logits seed sampling. Without one, nothing is
+        // held back and the trailing chunk carries the logits.
+        let floor = prefillHeldBackTokens(hasPrefillGraph: prefillFunction != nil)
+        let plan = prefillChunkSizes(
+            tokenCount: tokens.count, chunkSize: chunkSize, heldBack: floor)
 
         let chunkSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIClean Chunked Prefill",
-            details: "\(tokens.count) tokens in \(totalChunks) chunks of \(chunkSize)"
+            details: "\(tokens.count) tokens in \(plan.count) chunks of \(chunkSize)"
         )
 
         var lastLogits: [LogitsScalarType] = []
         var remainingTokens = tokens
-        var chunkIndex = 0
 
-        while !remainingTokens.isEmpty {
-            let currentChunkSize = min(chunkSize, remainingTokens.count)
+        for (chunkIndex, currentChunkSize) in plan.enumerated() {
             let chunkEnd = remainingTokens.startIndex + currentChunkSize
             let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
 
             CLILogger.log(
-                "Chunk \(chunkIndex + 1)/\(totalChunks): \(chunk.count) tokens at position \(processedTokenCount)"
+                "Chunk \(chunkIndex + 1)/\(plan.count): \(chunk.count) tokens at position \(processedTokenCount)"
             )
 
-            lastLogits = try await processTokenBatch(chunk)
+            if let prefillFn = prefillFunction {
+                try await encodePrefillChunk(chunk, using: prefillFn)
+            } else {
+                lastLogits = try await processTokenBatch(chunk)
+            }
             remainingTokens = remainingTokens[chunkEnd...]
-            chunkIndex += 1
+        }
+
+        if !remainingTokens.isEmpty {
+            lastLogits = try await processTokenBatch(remainingTokens)
         }
 
         InstrumentsProfiler.endCustomInterval(
